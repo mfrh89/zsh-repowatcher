@@ -50,6 +50,11 @@ class PluginTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         return result
 
+    def assert_scan_summary(self, output, checked=0, incoming=0, skipped=0, failed=0):
+        for count, label in ((checked, 'checked'), (incoming, 'with incoming commits'),
+                             (skipped, 'skipped'), (failed, 'failed')):
+            self.assertRegex(output, rf'\b{count} {label}\b')
+
     def test_fetch_does_not_change_checkout(self):
         self.incoming()
         self.shell('repowatcher fetch; repowatcher status')
@@ -156,9 +161,50 @@ class PluginTests(unittest.TestCase):
     def test_scan_fetches_without_pull_and_deduplicates(self):
         self.incoming()
         output = self.shell('REPOWATCHER_ROOTS=("$PWD" "$PWD"); repowatcher scan').stdout
+        self.assert_scan_summary(output, checked=1, incoming=1)
         self.assertEqual(output.count('DESCRIPTION'), 1)
         self.assertNotEqual(self.git(self.repo, 'rev-parse', '@{u}'), self.initial)
         self.assertEqual(self.git(self.repo, 'rev-parse', 'HEAD'), self.initial)
+
+    def test_scan_reports_no_incoming_commits_without_changing_caller_directory(self):
+        output = self.shell('REPOWATCHER_ROOTS=("$PWD" "$PWD"); cd "$HOME"; '
+                            'repowatcher scan; print -r -- "caller=$PWD"').stdout
+        self.assert_scan_summary(output, checked=1)
+        self.assertIn(f'caller={self.base}', output)
+        self.assertEqual(self.git(self.repo, 'rev-parse', 'HEAD'), self.initial)
+
+    def test_scan_reports_when_no_repositories_are_found(self):
+        empty = self.base / 'empty'
+        empty.mkdir()
+        output = self.shell('REPOWATCHER_ROOTS=("$HOME/empty"); repowatcher scan').stdout
+        self.assertRegex(output.lower(), r'no repositories found')
+
+    def test_scan_counts_skipped_repositories_separately(self):
+        self.git(self.repo, 'config', 'repowatcher.mode', 'off')
+        output = self.shell('REPOWATCHER_ROOTS=("$PWD" "$HOME/seed"); repowatcher scan').stdout
+        self.assert_scan_summary(output, checked=1, skipped=1)
+
+    def test_scan_does_not_count_detached_or_untracked_branches_as_checked(self):
+        self.git(self.repo, 'checkout', '--detach')
+        output = self.shell('REPOWATCHER_ROOTS=("$PWD"); repowatcher scan').stdout
+        self.assert_scan_summary(output, skipped=1)
+        self.git(self.repo, 'checkout', 'main')
+        self.git(self.repo, 'branch', '--unset-upstream')
+        self.git(self.repo, 'config', 'repowatcher.base', 'off')
+        output = self.shell('REPOWATCHER_ROOTS=("$PWD"); repowatcher scan').stdout
+        self.assert_scan_summary(output, skipped=1)
+
+    def test_scan_keeps_failed_fetches_failed_while_throttled(self):
+        self.shell('repowatcher fetch')
+        self.git(self.repo, 'remote', 'set-url', 'origin', str(self.base / 'missing'))
+        self.shell('repowatcher fetch', ok=False)
+        output = self.shell('REPOWATCHER_ROOTS=("$PWD" "$HOME/seed"); repowatcher scan').stdout
+        self.assert_scan_summary(output, checked=1, failed=1)
+
+    def test_scan_reports_invalid_repository_settings_as_failed(self):
+        self.git(self.repo, 'config', 'repowatcher.mode', 'invalid')
+        output = self.shell('REPOWATCHER_ROOTS=("$PWD"); repowatcher scan').stdout
+        self.assert_scan_summary(output, failed=1)
 
     def test_scan_exclusion_and_depth(self):
         self.incoming()

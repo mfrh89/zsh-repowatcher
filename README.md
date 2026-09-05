@@ -118,6 +118,19 @@ See the [configuration reference](docs/configuration.md) for every setting, excl
 
 The automatic prompt notice concerns only the repository you are in. `scan` is an explicit command for checking several repositories, not a scheduled service.
 
+A scan always reports its result, even when there are no incoming commits:
+
+```text
+repowatcher: scan complete (last fetched state): 3 checked, 0 with incoming commits, 0 skipped, 0 failed.
+```
+
+`with incoming commits` counts repositories, including base-branch updates, not
+individual commits. Disabled repositories and branches without a usable comparison
+are skipped. Invalid repository settings and unsuccessful or busy fetches count as
+failed, not checked. If no repositories are discovered, the scan says so.
+The summary uses the last successfully fetched state and does not bypass the
+configured fetch interval. Automatic prompt checks remain quiet without updates.
+
 A background fetch may finish after the prompt appears. Press Enter to see the result at the next prompt. The plugin does not interrupt an input line when a fetch finishes, monitor closed shells, or check every repository on your machine automatically.
 
 ## What an update can change
