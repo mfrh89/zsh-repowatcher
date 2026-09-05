@@ -361,17 +361,34 @@ _repowatcher_discover() {
     local canonical=${directory:A}
     [[ -n ${discovered[$canonical]-} ]] && return 0
     discovered[$canonical]=1
+    # Preserve the caller's cwd; report checked/failed/skipped/incoming as 0/1/2/3.
     (
       builtin cd -- "$directory" || exit 1
-      _repowatcher_context || exit 0
-      [[ $_rw_mode != off && $_rw_fetch == true ]] || exit 0
+      _repowatcher_context || exit 1
+      [[ $_rw_mode != off && $_rw_fetch == true ]] || exit 2
       [[ -e $_rw_cache/lock ]] || (umask 077; : >> "$_rw_cache/lock")
-      _repowatcher_fetch false || { print -r -- "repowatcher: $directory: fetch failed or busy."; exit 0; }
-      _repowatcher_counts || exit 0
+      _repowatcher_fetch false && [[ -e $_rw_cache/success ]] || {
+        _repowatcher_text "$directory" 1000
+        print -r -- "repowatcher: $REPLY: fetch failed or busy."
+        exit 1
+      }
+      _repowatcher_counts || exit 2
+      [[ -n $_rw_upstream || -n $_rw_base ]] || exit 2
       _repowatcher_table
       (( _rw_ahead > 0 && _rw_behind > 0 )) && print -r -- "repowatcher: branches have diverged ($_rw_ahead ahead, $_rw_behind behind); update skipped."
+      (( _rw_behind > 0 || _rw_base_behind > 0 )) && exit 3
       exit 0
     )
+    local scan_result=$?
+    case $scan_result in
+      0|3)
+        (( scan_result == 3 )) && (( ++incoming ))
+        (( ++checked ))
+        discovered[$canonical]=checked
+        ;;
+      2) (( ++skipped )) ;;
+      *) (( ++failed )) ;;
+    esac
     return 0
   fi
   (( depth > 0 )) || return 0
@@ -385,6 +402,7 @@ _repowatcher_discover() {
 _repowatcher_scan() {
   emulate -L zsh
   local root depth=${REPOWATCHER_DEPTH:-5}
+  local -i checked=0 incoming=0 skipped=0 failed=0
   [[ $depth == <-> ]] || { print -u2 -- 'repowatcher: invalid scan depth.'; return 1; }
   local -A discovered
   local -a exclusions
@@ -397,8 +415,13 @@ _repowatcher_scan() {
   for root in "${REPOWATCHER_ROOTS[@]}"; do
     _repowatcher_discover "$root" "$depth"
   done
+  if (( ${#discovered} == 0 )); then
+    print -r -- 'repowatcher: scan complete: no repositories found.'
+  else
+    print -r -- "repowatcher: scan complete (last fetched state): $checked checked, $incoming with incoming commits, $skipped skipped, $failed failed."
+  fi
   # The explicit scan already displayed this repository; do not repeat it when the prompt returns.
-  if _repowatcher_context && [[ -n ${discovered[$_rw_root]-} ]] && _repowatcher_counts; then
+  if _repowatcher_context && [[ ${discovered[$_rw_root]-} == checked ]] && _repowatcher_counts; then
     local shown_key="$_rw_root:$_rw_head:$_rw_upstream:$_rw_base:$_rw_mode"
     _repowatcher_seen[$shown_key]=1
   fi

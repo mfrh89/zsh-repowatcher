@@ -10,6 +10,16 @@ Notifications are normally shown once per current branch/upstream/base commit st
 
 `repowatcher status` reads existing remote-tracking refs. It does not fetch. `scan` respects the automatic fetch interval, whereas explicit `fetch` and `pull` commands request an immediate fetch.
 
+Every scan prints a completion message. It reports checked repositories, those with
+incoming upstream or base commits, skipped repositories, and failed checks.
+Overlapping roots count each canonical repository once. Repositories with mode
+`off`, fetching disabled, no current commit/branch, or no upstream/base comparison
+are skipped. Invalid settings and failed or busy fetches are failures. A failed
+fetch remains a failure during the retry interval; old remote-tracking refs do not
+turn it into a successful check. A scan with no discovered repositories reports
+that separately. Partial failures still allow other repositories to be checked;
+the scan's existing exit-status behavior is unchanged.
+
 ## Applying updates
 
 The current branch must track an upstream and be strictly behind it. Uncommitted tracked changes, untracked files, or diverged commits block an update. So do merge, rebase, cherry-pick, revert, sequencer, and bisect operations.
