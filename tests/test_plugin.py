@@ -111,7 +111,7 @@ class PluginTests(unittest.TestCase):
     def test_notify_reports_without_mutating(self):
         self.incoming()
         result = self.shell('repowatcher fetch; REPOWATCHER_FETCH=false; REPOWATCHER_MODE=notify; _repowatcher_prompt; _repowatcher_prompt')
-        self.assertEqual(result.stdout.count('incoming commit'), 1)
+        self.assertEqual(result.stdout.count('DESCRIPTION'), 1)
         self.assertEqual(self.git(self.repo, 'rev-parse', 'HEAD'), self.initial)
 
     def test_auto_applies_fresh_fetch(self):
@@ -156,7 +156,7 @@ class PluginTests(unittest.TestCase):
     def test_scan_fetches_without_pull_and_deduplicates(self):
         self.incoming()
         output = self.shell('REPOWATCHER_ROOTS=("$PWD" "$PWD"); repowatcher scan').stdout
-        self.assertEqual(output.count('incoming,'), 1)
+        self.assertEqual(output.count('DESCRIPTION'), 1)
         self.assertNotEqual(self.git(self.repo, 'rev-parse', '@{u}'), self.initial)
         self.assertEqual(self.git(self.repo, 'rev-parse', 'HEAD'), self.initial)
 
@@ -182,6 +182,176 @@ class PluginTests(unittest.TestCase):
         self.shell('REPOWATCHER_MODE=auto; for n in {1..5}; do _repowatcher_prompt; sleep 0.1; done')
         self.assertEqual(self.git(self.repo, 'rev-parse', 'HEAD'), self.git(self.seed, 'rev-parse', 'HEAD'))
 
+    def feature(self):
+        self.git(self.repo, 'checkout', '-b', 'feature')
+        self.commit(self.repo, 'feature-local')
+        self.git(self.repo, 'push', '-u', 'origin', 'feature')
+
+    def test_base_only_is_shown_and_never_applied(self):
+        self.feature()
+        head = self.git(self.repo, 'rev-parse', 'HEAD')
+        self.incoming()
+        output = self.shell('repowatcher fetch; REPOWATCHER_FETCH=false; REPOWATCHER_MODE=auto; _repowatcher_prompt').stdout
+        self.assertIn('origin/main', output)
+        self.assertIn('base', output)
+        self.assertIn('incoming', output)
+        self.assertNotIn('Apply now?', output)
+        self.assertEqual(self.git(self.repo, 'rev-parse', 'HEAD'), head)
+
+    def test_upstream_and_base_are_separate(self):
+        self.feature()
+        self.incoming()
+        self.git(self.seed, 'fetch')
+        self.git(self.seed, 'checkout', '-b', 'feature', 'origin/feature')
+        self.commit(self.seed, 'feature-incoming')
+        self.git(self.seed, 'push')
+        feature_head = self.git(self.seed, 'rev-parse', 'HEAD')
+        output = self.shell('repowatcher fetch; repowatcher status').stdout
+        self.assertIn('origin/main', output)
+        self.assertIn('origin/feature', output)
+        self.shell('repowatcher pull')
+        self.assertEqual(self.git(self.repo, 'rev-parse', 'HEAD'), feature_head)
+        self.assertFalse((self.repo / 'incoming').exists())
+
+    def test_missing_upstream_still_shows_base(self):
+        self.git(self.repo, 'checkout', '-b', 'unpublished')
+        self.incoming()
+        output = self.shell('repowatcher fetch; repowatcher status').stdout
+        self.assertIn('base information only', output)
+        self.assertIn('origin/main', output)
+        self.assertNotEqual(self.shell('repowatcher pull', ok=False).returncode, 0)
+
+    def test_base_override_and_disable(self):
+        self.feature()
+        self.incoming()
+        self.git(self.repo, 'config', '--local', 'repowatcher.base', 'off')
+        output = self.shell('repowatcher fetch; repowatcher status').stdout
+        self.assertNotIn('DESCRIPTION', output)
+        self.git(self.repo, 'config', '--local', 'repowatcher.base', 'origin/main')
+        self.assertIn('DESCRIPTION', self.shell('repowatcher status').stdout)
+
+    def test_no_default_branch_is_not_guessed(self):
+        self.feature()
+        self.incoming()
+        self.shell('repowatcher fetch')
+        self.git(self.repo, 'symbolic-ref', '--delete', 'refs/remotes/origin/HEAD')
+        self.assertNotIn('DESCRIPTION', self.shell('repowatcher status').stdout)
+
+    def test_description_limit_and_five_rows(self):
+        for n in range(7):
+            self.git(self.seed, 'commit', '--allow-empty', '-m', str(n) + 'ü' * 60)
+        self.git(self.seed, 'push')
+        output = self.shell('COLUMNS=200; repowatcher fetch; repowatcher status').stdout
+        rows = [line for line in output.splitlines() if line.startswith('│ working tree')]
+        self.assertEqual(len(rows), 6)
+        for line in rows[:5]:
+            description = line.split('│')[-2].strip()
+            self.assertEqual(len(description), 50)
+            self.assertTrue(description.endswith('…'))
+        self.assertIn('2 more commits', rows[-1])
+
+    def test_links_are_optional_and_provider_specific(self):
+        self.incoming()
+        self.shell('repowatcher fetch')
+        sha = self.git(self.seed, 'rev-parse', 'HEAD')
+        for remote, path in [('git@github.com:owner/repo.git', 'https://github.com/owner/repo/commit/'),
+                             ('https://gitlab.com/team/repo.git', 'https://gitlab.com/team/repo/-/commit/'),
+                             ('ssh://git@bitbucket.org/team/repo.git', 'https://bitbucket.org/team/repo/commits/')]:
+            self.git(self.repo, 'remote', 'set-url', 'origin', remote)
+            output = self.shell('REPOWATCHER_LINKS=on; repowatcher status').stdout
+            self.assertIn('\x1b]8;;' + path + sha, output)
+            self.assertIn(' ' + sha[:7], output)
+            self.assertNotIn('\x1b', self.shell('REPOWATCHER_LINKS=off; repowatcher status').stdout)
+        self.git(self.repo, 'remote', 'set-url', 'origin', 'https://token@example.invalid/team/repo.git')
+        output = self.shell('REPOWATCHER_LINKS=on; repowatcher status').stdout
+        self.assertNotIn('token', output)
+        self.assertNotIn('\x1b', output)
+
+    def test_commit_subject_controls_are_sanitized(self):
+        self.git(self.seed, 'commit', '--allow-empty', '-m', 'unsafe\x1b]8;;https://bad.example\x07subject')
+        self.git(self.seed, 'push')
+        output = self.shell('repowatcher fetch; REPOWATCHER_LINKS=off; repowatcher status').stdout
+        self.assertNotIn('\x1b', output)
+        self.assertNotIn('\x07', output)
+
+    def test_frames_fit_terminal_and_links_do_not_affect_width(self):
+        self.incoming()
+        self.shell('repowatcher fetch')
+        self.git(self.repo, 'remote', 'set-url', 'origin', 'git@github.com:owner/repo.git')
+        import re
+        for columns in [60, 80, 160]:
+            output = self.shell(f'COLUMNS={columns}; REPOWATCHER_LINKS=on; repowatcher status').stdout
+            plain = re.sub(r'\x1b\]8;;.*?\x1b\\', '', output)
+            lines = [line for line in plain.splitlines() if line.startswith(('┌', '├', '└', '│'))]
+            self.assertEqual(len({len(line) for line in lines}), 1, plain)
+            self.assertLessEqual(len(lines[0]), columns)
+
+    def test_wide_unicode_cells_align_with_borders(self):
+        import unicodedata
+        self.git(self.seed, 'commit', '--allow-empty', '-m', '界' * 50)
+        self.git(self.seed, 'push')
+        output = self.shell('COLUMNS=80; repowatcher fetch; REPOWATCHER_LINKS=off; repowatcher status').stdout
+        lines = [line for line in output.splitlines() if line.startswith(('┌', '├', '└', '│'))]
+        def width(line):
+            return sum(0 if unicodedata.combining(c) else 2 if unicodedata.east_asian_width(c) in ('W', 'F') else 1 for c in line)
+        self.assertEqual(len({width(line) for line in lines}), 1, output)
+        self.assertLessEqual(width(lines[0]), 80)
+
+    def test_scan_suppresses_duplicate_current_repo_prompt(self):
+        self.incoming()
+        output = self.shell('REPOWATCHER_ROOTS=("$PWD"); repowatcher scan; REPOWATCHER_FETCH=false; _repowatcher_prompt').stdout
+        self.assertEqual(output.count('DESCRIPTION'), 1)
+
+    def test_new_branch_identity_is_rechecked_before_update(self):
+        self.incoming()
+        result = self.shell('repowatcher fetch; _repowatcher_counts; previous=$_rw_branch; git checkout -b other; git branch --set-upstream-to origin/main; _repowatcher_pull "$_rw_head" "$_rw_upstream" "$previous"', ok=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.git(self.repo, 'rev-parse', 'HEAD'), self.initial)
+
+    def test_real_prompt_precedes_table_and_decline_preserves_input(self):
+        self.real_prompt_flow(b'n\n')
+
+    def test_real_prompt_precedes_table_and_accept_applies_upstream(self):
+        self.real_prompt_flow(b'y\n')
+
+    def real_prompt_flow(self, response):
+        self.incoming()
+        self.shell('repowatcher fetch')
+        (self.base / '.zshrc').write_text(
+            f'source "{PLUGIN}"\nREPOWATCHER_FETCH=false\nPS1="LOCATION:%~ > "\n')
+        pid, master = pty.fork()
+        if pid == 0:
+            os.chdir(self.repo)
+            os.execvpe('zsh', ['zsh', '-di'], dict(self.env, ZDOTDIR=str(self.base), TERM='xterm-256color'))
+        output = b''
+        def until(marker):
+            nonlocal output
+            deadline = time.monotonic() + 10
+            while marker not in output and time.monotonic() < deadline:
+                if select.select([master], [], [], 0.1)[0]:
+                    try:
+                        output += os.read(master, 4096)
+                    except OSError:
+                        break
+            self.assertIn(marker, output)
+        try:
+            until(b'Apply now?')
+            self.assertIn(b'LOCATION:', output)
+            self.assertIn(b'\x1b[1m', output)
+            self.assertLess(output.index(b'LOCATION:'), output.index(b'DESCRIPTION'))
+            time.sleep(0.2)
+            os.write(master, response)
+            output = b''
+            until(b'LOCATION:')
+            os.write(master, b"print -- INPUT''_RESTORED\n")
+            until(b'INPUT_RESTORED')
+            expected = self.git(self.seed, 'rev-parse', 'HEAD') if response.startswith(b'y') else self.initial
+            self.assertEqual(self.git(self.repo, 'rev-parse', 'HEAD'), expected)
+        finally:
+            os.close(master)
+            os.kill(pid, 9)
+            os.waitpid(pid, 0)
+
     def test_interactive_confirmation_and_decline(self):
         self.incoming()
         for response in [b'\n', b'y']:
@@ -203,6 +373,8 @@ class PluginTests(unittest.TestCase):
                             except OSError:
                                 break
                     self.assertIn(b'Apply now?', output)
+                    self.assertIn(b'DESCRIPTION', output)
+                    self.assertLess(output.index(b'DESCRIPTION'), output.index(b'Apply now?'))
                     time.sleep(0.2)
                     os.write(master, response)
                     while time.monotonic() < deadline:

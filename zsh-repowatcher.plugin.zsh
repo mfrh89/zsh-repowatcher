@@ -5,7 +5,6 @@ zmodload zsh/datetime
 zmodload zsh/stat
 zmodload zsh/system
 zmodload zsh/zselect
-autoload -Uz add-zsh-hook
 
 # This is trusted, user-owned shell configuration, never a project-local file.
 if [[ -r ${REPOWATCHER_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/repowatcher/config.zsh} ]]; then
@@ -56,23 +55,205 @@ _repowatcher_fetch() {
 
 _repowatcher_counts() {
   emulate -L zsh
-  command git symbolic-ref -q HEAD >/dev/null || return 1
-  typeset -g _rw_head=$(command git rev-parse HEAD 2>/dev/null) || return 1
-  typeset -g _rw_upstream=$(command git rev-parse --verify '@{upstream}' 2>/dev/null) || return 1
-  local counts=$(command git rev-list --left-right --count "$_rw_head...$_rw_upstream" 2>/dev/null) || return 1
-  local -a values=( ${(z)counts} )
-  typeset -g _rw_ahead=$values[1] _rw_behind=$values[2]
+  typeset -g _rw_branch _rw_head _rw_upstream='' _rw_upstream_ref='' _rw_ahead=0 _rw_behind=0
+  _rw_branch=$(command git symbolic-ref -q --short HEAD) || return 1
+  _rw_head=$(command git rev-parse --verify HEAD 2>/dev/null) || return 1
+  if _rw_upstream=$(command git rev-parse --verify '@{upstream}' 2>/dev/null); then
+    _rw_upstream_ref=$(command git rev-parse --abbrev-ref '@{upstream}' 2>/dev/null)
+    local counts=$(command git rev-list --left-right --count "$_rw_head...$_rw_upstream" 2>/dev/null) || return 1
+    local -a values=( ${(z)counts} )
+    _rw_ahead=$values[1]; _rw_behind=$values[2]
+  else
+    _rw_upstream=''
+  fi
+  _repowatcher_base
+  return 0
+}
+
+# Resolve the remote default branch without guessing that it is named main.
+_repowatcher_base() {
+  emulate -L zsh
+  local base remote
+  typeset -g _rw_base='' _rw_base_ref='' _rw_base_behind=0
+  base=$(command git config --local --get repowatcher.base 2>/dev/null)
+  [[ $base == off ]] && return 0
+  if [[ -z $base ]]; then
+    remote=$(command git config --get "branch.$_rw_branch.remote" 2>/dev/null)
+    [[ -n $remote && $remote != . ]] || remote=origin
+    base=$(command git symbolic-ref -q "refs/remotes/$remote/HEAD" 2>/dev/null) || return 0
+  fi
+  local commit=$(command git rev-parse --verify --end-of-options "${base}^{commit}" 2>/dev/null) || return 0
+  [[ -n $commit && $commit != $_rw_upstream ]] || return 0
+  typeset -g _rw_base=$commit _rw_base_ref=${base#refs/remotes/}
+  _rw_base_behind=$(command git rev-list --count "$_rw_head..$_rw_base" 2>/dev/null) || _rw_base_behind=0
+}
+
+# Git subjects, branch names, and paths must never inject terminal controls.
+_repowatcher_text() {
+  emulate -L zsh
+  local value=${1//[[:cntrl:]]/ } limit=$2
+  (( ${#value} > limit )) && value="${value[1,$((limit - 1))]}…"
+  typeset -g REPLY=$value
+}
+
+_repowatcher_commit_link() {
+  emulate -L zsh
+  local hash=$1 ref=$2 remote url host project prefix
+  typeset -g REPLY=${hash[1,7]} _rw_linked=false
+  local mode=${REPOWATCHER_LINKS:-auto}
+  [[ $mode != off ]] || return 0
+  if [[ $mode != on ]]; then
+    [[ -t 1 && $TERM != dumb ]] || return 0
+    [[ ${TERM_PROGRAM-} == (iTerm.app|WezTerm|vscode|ghostty) || ${TERM-} == (xterm-ghostty|xterm-kitty) ]] || return 0
+  fi
+  # Resolve the remote from the actual tracking ref, including remote names with slashes.
+  local fullref=$(command git rev-parse --symbolic-full-name --verify --end-of-options "$ref" 2>/dev/null)
+  [[ $fullref == refs/remotes/* ]] || return 0
+  local candidate
+  for candidate in ${(f)"$(command git remote)"}; do
+    if [[ $fullref == refs/remotes/$candidate/* && ${#candidate} -gt ${#remote} ]]; then remote=$candidate; fi
+  done
+  [[ -n $remote ]] || return 0
+  url=$(command git remote get-url "$remote" 2>/dev/null) || return 0
+  case $url in
+    https://*|http://*) url=${url#*://} ;;
+    git@*:*) url=${url#git@}; url=${url/:/\/} ;;
+    ssh://git@*) url=${url#ssh://git@} ;;
+    *) return 0 ;;
+  esac
+  host=${url%%/*}
+  project=${url#*/}
+  project=${project%.git}
+  [[ -n $project && $project != *[^a-zA-Z0-9._/-]* ]] || return 0
+  case $host in
+    github.com) prefix="https://$host/$project/commit/" ;;
+    gitlab.com) prefix="https://$host/$project/-/commit/" ;;
+    bitbucket.org) prefix="https://$host/$project/commits/" ;;
+    *) return 0 ;;
+  esac
+  _rw_linked=true
+  REPLY=$'\e]8;;'"$prefix$hash"$'\e\\'"${REPOWATCHER_LINK_ICON:-} ${hash[1,7]}"$'\e]8;;\e\\'
+}
+
+_repowatcher_cell() {
+  emulate -L zsh
+  local value=$1 width=$2
+  # Zsh's m flag measures terminal columns, including wide Unicode characters.
+  if (( ${(m)#value} > width )); then
+    while (( ${(m)#value} > width - 1 )); do value=${value[1,-2]}; done
+    value+='…'
+  fi
+  typeset -g REPLY="${(mr:$width:)value}"
+}
+
+_repowatcher_border() {
+  emulate -L zsh
+  local left=$1 middle=$2 right=$3 line=$1 empty='' width index
+  for index in {1..6}; do
+    width=$(( widths[index] + 2 ))
+    line+="${(l:$width::─:)empty}"
+    if (( index == 6 )); then line+=$right; else line+=$middle; fi
+  done
+  print -r -- "$line"
+}
+
+_repowatcher_render() {
+  emulate -L zsh
+  local -a headers=(REPO BRANCH KIND SOURCE COMMIT DESCRIPTION) widths=(4 6 4 6 7 11) minimum=(4 6 4 6 7 8)
+  local index column row total widest value line padded hash ref
+  for (( index=1; index<=${#cells}; index++ )); do
+    column=$(( (index - 1) % 6 + 1 ))
+    value=$cells[index]
+    (( ${(m)#value} > widths[column] )) && widths[column]=${(m)#value}
+  done
+  minimum[5]=$widths[5]
+  local available=${COLUMNS:-120}
+  [[ $available == <-> ]] || available=120
+  (( available > 0 )) || available=120
+  # Six cells need 19 columns for padding and separators.
+  while true; do
+    total=19
+    for column in {1..6}; do (( total += widths[column] )); done
+    (( total <= available )) && break
+    widest=0
+    for column in {1..6}; do
+      if (( widths[column] > minimum[column] && (widest == 0 || widths[column] > widths[widest]) )); then widest=$column; fi
+    done
+    (( widest > 0 )) || break
+    (( widths[widest]-- ))
+  done
+  print
+  _repowatcher_border '┌' '┬' '┐'
+  line='│'
+  for column in {1..6}; do
+    _repowatcher_cell "$headers[column]" "$widths[column]"
+    line+=" $REPLY │"
+  done
+  if [[ -t 1 && $TERM != dumb && ! -v NO_COLOR ]]; then
+    print -r -- $'\e[1m'"$line"$'\e[22m'
+  else
+    print -r -- "$line"
+  fi
+  _repowatcher_border '├' '┼' '┤'
+  for (( row=1; row<=${#hashes}; row++ )); do
+    line='│'
+    for column in {1..6}; do
+      index=$(( (row - 1) * 6 + column ))
+      _repowatcher_cell "$cells[index]" "$widths[column]"
+      padded=$REPLY
+      if (( column == 5 )) && [[ -n $hashes[row] ]]; then
+        # Store links separately so control sequences never affect column sizing.
+        local visible=$cells[index]
+        padded="$rendered_links[row]${padded[$(( ${#visible} + 1 )),-1]}"
+      fi
+      line+=" $padded │"
+    done
+    print -r -- "$line"
+  done
+  _repowatcher_border '└' '┴' '┘'
+}
+
+_repowatcher_table() {
+  emulate -L zsh
+  (( _rw_behind > 0 || _rw_base_behind > 0 )) || return 0
+  local repo branch source kind ref count line hash subject index
+  local -a cells hashes row_refs rendered_links
+  _repowatcher_text "${_rw_root:t}" 1000; repo=$REPLY
+  _repowatcher_text "$_rw_branch" 1000; branch=$REPLY
+  local -a kinds=(upstream base) refs=("$_rw_upstream_ref" "$_rw_base_ref") counts=("$_rw_behind" "$_rw_base_behind") commits=("$_rw_upstream" "$_rw_base")
+  for index in 1 2; do
+    kind=$kinds[$index]; ref=$refs[$index]; count=$counts[$index]
+    (( count > 0 )) || continue
+    _repowatcher_text "$ref" 1000; source=$REPLY
+    for line in ${(f)"$(command git --no-pager log -5 --format='%H%x09%s' "$_rw_head..$commits[$index]" 2>/dev/null)"}; do
+      hash=${line%%$'\t'*}; subject=${line#*$'\t'}
+      _repowatcher_text "$subject" 50; subject=$REPLY
+      _repowatcher_commit_link "$hash" "$ref"
+      rendered_links+=("$REPLY")
+      local label=${hash[1,7]}
+      [[ $_rw_linked == true ]] && label="${REPOWATCHER_LINK_ICON:-} $label"
+      cells+=("$repo" "$branch" "$kind" "$source" "$label" "$subject")
+      hashes+=("$hash"); row_refs+=("$ref")
+    done
+    if (( count > 5 )); then
+      cells+=("$repo" "$branch" "$kind" "$source" '' "… $((count - 5)) more commits")
+      hashes+=(''); row_refs+=(''); rendered_links+=('')
+    fi
+  done
+  _repowatcher_render
+  (( _rw_base_behind > 0 )) && print -r -- 'Base commits are informational; Apply updates the upstream only.'
+  return 0
 }
 
 _repowatcher_pull() {
   emulate -L zsh
-  local expected_head=$1 expected_upstream=$2 fd gitdir marker dirty
+  local expected_head=$1 expected_upstream=$2 expected_branch=${3:-$_rw_branch} fd gitdir marker dirty
   zsystem flock -t 0 -f fd "$_rw_cache/lock" 2>/dev/null || {
     print -r -- 'repowatcher: another check is running; try again.'; return 2
   }
   {
     _repowatcher_counts || return 1
-    [[ $_rw_head == $expected_head && $_rw_upstream == $expected_upstream ]] || {
+    [[ $_rw_head == $expected_head && $_rw_upstream == $expected_upstream && $_rw_branch == $expected_branch ]] || {
       print -r -- 'repowatcher: branch changed; check again.'; return 1
     }
     (( _rw_ahead == 0 && _rw_behind > 0 )) || return 1
@@ -103,16 +284,25 @@ _repowatcher_prompt() {
     (_repowatcher_fetch false) &!
   fi
   _repowatcher_counts || return 0
-  (( _rw_behind > 0 )) || return 0
-  local key="$_rw_root:$_rw_head:$_rw_upstream:$_rw_mode"
+  (( _rw_behind > 0 || _rw_base_behind > 0 )) || return 0
+  local key="$_rw_root:$_rw_head:$_rw_upstream:$_rw_base:$_rw_mode"
   [[ -z ${_repowatcher_seen[$key]-} ]] || return 0
   local name=${_rw_root:t}
+  if zle 2>/dev/null; then
+    # Paint the real theme prompt before handing the terminal to the notice.
+    zle -R
+    zle -I
+  fi
+  _repowatcher_table
+  if (( _rw_behind == 0 )); then
+    _repowatcher_seen[$key]=1
+    return 0
+  fi
   if (( _rw_ahead > 0 )); then
     print -r -- "repowatcher: $name has diverged ($_rw_ahead ahead, $_rw_behind behind); update skipped."
     _repowatcher_seen[$key]=1
     return 0
   fi
-  print -r -- "repowatcher: $name has $_rw_behind incoming commit(s)."
   # Only mutate after a successful recent fetch, never based on stale refs.
   local -A info
   local fresh=false
@@ -122,13 +312,36 @@ _repowatcher_prompt() {
   if [[ $_rw_mode == auto && $fresh == true ]]; then
     _repowatcher_pull "$_rw_head" "$_rw_upstream"
     (( $? == 2 )) && return 0
-  elif [[ $_rw_mode == ask && -o interactive && -t 0 && -t 1 ]]; then
-    # Do not consume pasted commands or input already waiting at the terminal.
-    zselect -t 0 -r 0 2>/dev/null && return 0
-    local answer
-    if read -q 'answer?Apply now? [y/N] '; then
+  elif [[ $_rw_mode == ask && -o interactive && -t 1 ]] && { [[ -t 0 ]] || zle 2>/dev/null; }; then
+    # ZLE owns stdin while a widget runs; inspect its pending input instead.
+    if zle 2>/dev/null; then
+      (( PENDING > 0 || KEYS_QUEUED_COUNT > 0 )) && return 0
+      [[ -n $BUFFER ]] && return 0
+    else
+      zselect -t 0 -r 0 2>/dev/null && return 0
+    fi
+    local answer confirmed=false
+    if zle 2>/dev/null; then
+      # line-init runs before ZLE enters raw input mode; read a full tty line.
+      print -n -- 'Apply now? [y/N] '
+      if IFS= read -r answer </dev/tty; then
+        [[ $answer == (y|Y|yes|YES) ]] && confirmed=true
+      fi
+    elif read -q 'answer?Apply now? [y/N] '; then
+      confirmed=true
+    fi
+    if [[ $confirmed == true ]]; then
       print
-      repowatcher pull
+      local preview_head=$_rw_head preview_upstream=$_rw_upstream preview_branch=$_rw_branch
+      if _repowatcher_fetch true; then
+        _repowatcher_pull "$preview_head" "$preview_upstream" "$preview_branch"
+        local applied=$?
+        # A concurrent fetch/branch change needs a new preview, not a silent update.
+        (( applied != 0 )) && return 0
+      else
+        print -r -- 'repowatcher: fetch failed or busy; update skipped.'
+        return 0
+      fi
     else
       print
     fi
@@ -155,7 +368,8 @@ _repowatcher_discover() {
       [[ -e $_rw_cache/lock ]] || (umask 077; : >> "$_rw_cache/lock")
       _repowatcher_fetch false || { print -r -- "repowatcher: $directory: fetch failed or busy."; exit 0; }
       _repowatcher_counts || exit 0
-      (( _rw_behind > 0 )) && print -r -- "repowatcher: $directory: $_rw_behind incoming, $_rw_ahead outgoing commit(s)."
+      _repowatcher_table
+      (( _rw_ahead > 0 && _rw_behind > 0 )) && print -r -- "repowatcher: branches have diverged ($_rw_ahead ahead, $_rw_behind behind); update skipped."
       exit 0
     )
     return 0
@@ -183,6 +397,12 @@ _repowatcher_scan() {
   for root in "${REPOWATCHER_ROOTS[@]}"; do
     _repowatcher_discover "$root" "$depth"
   done
+  # The explicit scan already displayed this repository; do not repeat it when the prompt returns.
+  if _repowatcher_context && [[ -n ${discovered[$_rw_root]-} ]] && _repowatcher_counts; then
+    local shown_key="$_rw_root:$_rw_head:$_rw_upstream:$_rw_base:$_rw_mode"
+    _repowatcher_seen[$shown_key]=1
+  fi
+  return 0
 }
 
 repowatcher() {
@@ -200,6 +420,8 @@ repowatcher() {
       print -r -- "fetch=$_rw_fetch mode=$_rw_mode interval=${_rw_interval}s"
       _repowatcher_counts || { print -r -- 'No current branch with a valid upstream.'; return 1; }
       print -r -- "$_rw_ahead ahead, $_rw_behind behind (last fetched state)."
+      [[ -n $_rw_upstream ]] || print -r -- "No upstream configured; base information only."
+      _repowatcher_table
       ;;
     fetch) _repowatcher_fetch true ;;
     pull)
@@ -210,6 +432,7 @@ repowatcher() {
         return $fetched
       fi
       _repowatcher_counts || return 1
+      [[ -n $_rw_upstream ]] || { print -r -- "repowatcher: no upstream configured."; return 1; }
       if (( _rw_behind == 0 )); then print -r -- 'repowatcher: no incoming commits.'; return 0; fi
       if (( _rw_ahead > 0 )); then print -r -- 'repowatcher: branches have diverged; update skipped.'; return 1; fi
       _repowatcher_pull "$_rw_head" "$_rw_upstream"
@@ -218,6 +441,10 @@ repowatcher() {
   esac
 }
 
-[[ -o interactive ]] && add-zsh-hook precmd _repowatcher_prompt
+if [[ -o interactive ]]; then
+  zmodload zsh/zle
+  autoload -Uz add-zle-hook-widget
+  add-zle-hook-widget line-init _repowatcher_prompt
+fi
 # Sourcing must succeed in noninteractive shells too.
 true
