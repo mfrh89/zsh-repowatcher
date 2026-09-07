@@ -11,7 +11,8 @@ if [[ -r ${REPOWATCHER_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/repowatcher/con
   source "${REPOWATCHER_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/repowatcher/config.zsh}"
 fi
 
-typeset -gA _repowatcher_seen
+typeset -gA _repowatcher_seen _repowatcher_displayed
+typeset -g _repowatcher_worker_fd='' _repowatcher_worker_root=''
 
 _repowatcher_context() {
   emulate -L zsh
@@ -34,9 +35,9 @@ _repowatcher_context() {
 
 _repowatcher_fetch() {
   emulate -L zsh
-  local force=${1:-false} fd last=0
+  local force=${1:-false} lock_wait=${2:-0} fd last=0
   local -A info
-  zsystem flock -t 0 -f fd "$_rw_cache/lock" 2>/dev/null || return 2
+  zsystem flock -t "$lock_wait" -f fd "$_rw_cache/lock" 2>/dev/null || return 2
   {
     if zstat -H info "$_rw_cache/attempt" 2>/dev/null; then last=$info[mtime]; fi
     [[ $force == true ]] || (( EPOCHSECONDS - last >= _rw_interval )) || return 0
@@ -274,14 +275,52 @@ _repowatcher_pull() {
   }
 }
 
+# ZLE watches a completion pipe; no polling, signals, or background terminal writes.
+_repowatcher_cleanup() {
+  emulate -L zsh
+  if [[ -n $_repowatcher_worker_fd ]]; then
+    zle -F "$_repowatcher_worker_fd" 2>/dev/null
+    exec {_repowatcher_worker_fd}<&-
+    _repowatcher_worker_fd=''
+  fi
+  _repowatcher_worker_root=''
+}
+
+_repowatcher_ready() {
+  emulate -L zsh
+  local root=$_repowatcher_worker_root
+  _repowatcher_cleanup
+  _repowatcher_context || return 0
+  [[ $_rw_root == $root ]] || return 0
+  # Never take terminal input away from a partially entered/pasted command.
+  (( PENDING > 0 || KEYS_QUEUED_COUNT > 0 )) && return 0
+  [[ -z $BUFFER ]] || return 0
+  _repowatcher_prompt completed
+  zle -R
+}
+
+_repowatcher_start_fetch() {
+  emulate -L zsh
+  if zle 2>/dev/null; then
+    [[ -z $_repowatcher_worker_fd ]] || return 0
+    _repowatcher_worker_root=$_rw_root
+    # Another shell may already be fetching. Wait only in this worker so its
+    # eventual refs still reach our idle prompt; all foreground calls stay nonblocking.
+    exec {_repowatcher_worker_fd}< <(_repowatcher_fetch false 30; print -r -- done 2>/dev/null)
+    zle -F -w "$_repowatcher_worker_fd" _repowatcher_ready
+  else
+    (_repowatcher_fetch false) &!
+  fi
+}
+
 _repowatcher_prompt() {
   emulate -L zsh
   _repowatcher_context || return 0
   [[ $_rw_mode != off ]] || return 0
   # Create once without truncating an existing lock file.
   [[ -e $_rw_cache/lock ]] || (umask 077; : >> "$_rw_cache/lock")
-  if [[ $_rw_fetch == true ]]; then
-    (_repowatcher_fetch false) &!
+  if [[ $_rw_fetch == true && ${1-} != completed ]]; then
+    _repowatcher_start_fetch
   fi
   _repowatcher_counts || return 0
   (( _rw_behind > 0 || _rw_base_behind > 0 )) || return 0
@@ -293,7 +332,10 @@ _repowatcher_prompt() {
     zle -R
     zle -I
   fi
-  _repowatcher_table
+  if [[ -z ${_repowatcher_displayed[$key]-} ]]; then
+    _repowatcher_table
+    _repowatcher_displayed[$key]=1
+  fi
   if (( _rw_behind == 0 )); then
     _repowatcher_seen[$key]=1
     return 0
@@ -301,6 +343,12 @@ _repowatcher_prompt() {
   if (( _rw_ahead > 0 )); then
     print -r -- "repowatcher: $name has diverged ($_rw_ahead ahead, $_rw_behind behind); update skipped."
     _repowatcher_seen[$key]=1
+    return 0
+  fi
+  # A completion callback only reports. Applying/asking runs at a normal prompt
+  # so a worker cannot interrupt editing or trigger network activity in ZLE.
+  if [[ ${1-} == completed && $_rw_mode == (ask|auto) ]]; then
+    print -r -- 'repowatcher: update ready. Press Enter to continue, or run `repowatcher pull`.'
     return 0
   fi
   # Only mutate after a successful recent fetch, never based on stale refs.
@@ -445,6 +493,8 @@ repowatcher() {
       print -r -- "$_rw_ahead ahead, $_rw_behind behind (last fetched state)."
       [[ -n $_rw_upstream ]] || print -r -- "No upstream configured; base information only."
       _repowatcher_table
+      local shown_key="$_rw_root:$_rw_head:$_rw_upstream:$_rw_base:$_rw_mode"
+      _repowatcher_displayed[$shown_key]=1
       ;;
     fetch) _repowatcher_fetch true ;;
     pull)
@@ -466,7 +516,10 @@ repowatcher() {
 
 if [[ -o interactive ]]; then
   zmodload zsh/zle
-  autoload -Uz add-zle-hook-widget
+  zle -N _repowatcher_ready
+  autoload -Uz add-zle-hook-widget add-zsh-hook
+  add-zsh-hook chpwd _repowatcher_cleanup
+  add-zsh-hook zshexit _repowatcher_cleanup
   add-zle-hook-widget line-init _repowatcher_prompt
 fi
 # Sourcing must succeed in noninteractive shells too.
