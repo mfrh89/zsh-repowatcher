@@ -4,9 +4,11 @@
 
 Automatic fetching runs in a detached worker when the line editor initializes for another command. It fetches all remotes, without recursively fetching submodules. The worker never changes checked-out files.
 
-The normal theme prompt is drawn before a commit table and confirmation. If the fetch has not finished, its new commits can appear at a subsequent prompt. Press Enter to check again. Finishing a fetch does not interrupt typing or immediately redraw an idle shell.
+The normal theme prompt is drawn before a commit table and confirmation. If the fetch finishes after the prompt appears, a completion callback shows its new commits at an idle prompt without requiring another command. Network latency still determines when new remote commits become visible. While a command is being typed or pasted, the notice waits until the next prompt. The callback only displays information: in ask or auto mode, press Enter to continue to the normal confirmation or automatic update. It never changes checked-out files or starts another fetch.
 
 Notifications are normally shown once per current branch/upstream/base commit state and mode in each shell. Declining does not discard the update; `repowatcher pull` remains available. After an explicit scan displays the current repository, the next prompt does not repeat that table or ask to apply it.
+
+`repowatcher status` displays the table once; the next prompt can still ask to apply it without repeating the table.
 
 `repowatcher status` reads existing remote-tracking refs. It does not fetch. `scan` respects the automatic fetch interval, whereas explicit `fetch` and `pull` commands request an immediate fetch.
 
@@ -36,7 +38,7 @@ Fetch output is stored in `fetch.log` under the repository's cache directory. An
 
 ## Concurrency and Git history
 
-Locks coordinate operations started by this plugin across shells and linked worktrees. They cannot prevent another application or unrelated Git command from editing the same repository. Use `ask` or `notify` when other processes actively work on the checkout.
+Locks coordinate operations started by this plugin across shells and linked worktrees. An interactive background worker waits up to 30 seconds for an existing operation, then reads the resulting state. This lets another shell’s completed fetch notify the idle prompt too. Foreground fetch/pull commands retain their immediate busy response. They cannot prevent another application or unrelated Git command from editing the same repository. Use `ask` or `notify` when other processes actively work on the checkout.
 
 Background fetches update remote-tracking refs. This can weaken the protection of `git push --force-with-lease` when it relies on those refs implicitly. Use an explicit expected commit when rewriting history; see the [Git push documentation](https://git-scm.com/docs/git-push).
 

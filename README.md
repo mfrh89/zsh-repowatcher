@@ -131,7 +131,7 @@ failed, not checked. If no repositories are discovered, the scan says so.
 The summary uses the last successfully fetched state and does not bypass the
 configured fetch interval. Automatic prompt checks remain quiet without updates.
 
-A background fetch may finish after the prompt appears. Press Enter to see the result at the next prompt. The plugin does not interrupt an input line when a fetch finishes, monitor closed shells, or check every repository on your machine automatically.
+A background fetch may finish after the prompt appears. Its completion shows new commits immediately at an idle prompt; while you type or paste, the notice waits until the next prompt. Press Enter to continue to confirmation (or an automatic update in auto mode). The callback only reports updates and preserves your input. An explicit `repowatcher status` shares its table with the next confirmation, so it is not printed twice. The plugin does not monitor closed shells or check every repository automatically.
 
 ## What an update can change
 

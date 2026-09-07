@@ -2,6 +2,7 @@
 import os
 import pty
 import select
+import shutil
 import time
 from pathlib import Path
 import subprocess
@@ -397,6 +398,160 @@ class PluginTests(unittest.TestCase):
             os.close(master)
             os.kill(pid, 9)
             os.waitpid(pid, 0)
+
+    def terminal(self, rc):
+        (self.base / '.zshrc').write_text(
+            f'source "{PLUGIN}"\nPS1="LOCATION:%~ > "\n' + rc)
+        pid, master = pty.fork()
+        if pid == 0:
+            os.chdir(self.base)
+            os.execvpe('zsh', ['zsh', '-di'], dict(self.env, ZDOTDIR=str(self.base), TERM='xterm-256color'))
+        def cleanup():
+            os.close(master)
+            try:
+                os.kill(pid, 9)
+                os.waitpid(pid, 0)
+            except ProcessLookupError:
+                pass
+        self.addCleanup(cleanup)
+        return master
+
+    def terminal_read(self, master, marker=None, duration=10):
+        output = b''
+        deadline = time.monotonic() + duration
+        while time.monotonic() < deadline:
+            if select.select([master], [], [], 0.05)[0]:
+                try:
+                    output += os.read(master, 65536)
+                except OSError:
+                    break
+            if marker is not None and marker in output:
+                break
+        if marker is not None:
+            self.assertIn(marker, output)
+        return output
+
+    def delayed_terminal(self, mode='ask'):
+        # Delay only the isolated fetch worker, without network or host fixtures.
+        return self.terminal(
+            f'source "{PLUGIN}"\nREPOWATCHER_MODE={mode}\n'
+            'functions[_repowatcher_original_fetch]=$functions[_repowatcher_fetch]\n'
+            '_repowatcher_fetch() { sleep 1; _repowatcher_original_fetch "$@"; }\n')
+
+    def test_delayed_fetch_notifies_idle_prompt_without_enter(self):
+        self.incoming()
+        master = self.delayed_terminal()
+        self.terminal_read(master, b'LOCATION:')
+        os.write(master, b"cd 'working tree'\n")
+        output = self.terminal_read(master, b'Press Enter to continue')
+        self.assertEqual(output.count(b'DESCRIPTION'), 1)
+        self.assertLess(output.index(b'LOCATION:'), output.index(b'DESCRIPTION'))
+        self.assertEqual(self.git(self.repo, 'rev-parse', 'HEAD'), self.initial)
+        os.write(master, b'\n')
+        output = self.terminal_read(master, b'Apply now?')
+        self.assertNotIn(b'DESCRIPTION', output)
+        os.write(master, b'n\n')
+        self.terminal_read(master, b'LOCATION:')
+        os.write(master, b"print -- SAFE''_INPUT\n")
+        output = self.terminal_read(master, b'SAFE_INPUT')
+        self.assertNotIn(b'Apply now?', output)
+
+    def test_competing_fetch_completion_reaches_idle_prompt(self):
+        self.incoming()
+        wrapper = self.base / 'bin'
+        wrapper.mkdir()
+        real_git = shutil.which('git')
+        (wrapper / 'git').write_text(
+            '#!/bin/sh\ncase " $* " in *" fetch "*) touch "$HOME/worker-started"; sleep 2;; esac\n'
+            f'exec "{real_git}" "$@"\n')
+        (wrapper / 'git').chmod(0o755)
+        worker = subprocess.Popen(
+            ['zsh', '-f', '-c', 'source "$1"; repowatcher fetch', 'test', str(PLUGIN)],
+            cwd=self.repo, env=dict(self.env, PATH=str(wrapper) + os.pathsep + self.env['PATH']),
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.addCleanup(lambda: worker.wait(timeout=10))
+        deadline = time.monotonic() + 5
+        while not (self.base / 'worker-started').exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertTrue((self.base / 'worker-started').exists())
+        master = self.terminal('')
+        self.terminal_read(master, b'LOCATION:')
+        start = time.monotonic()
+        os.write(master, b"cd 'working tree'\n")
+        first = self.terminal_read(master, b'LOCATION:')
+        self.assertLess(time.monotonic() - start, 1.5, first)
+        output = self.terminal_read(master, b'Press Enter to continue')
+        self.assertEqual(output.count(b'DESCRIPTION'), 1)
+        self.assertEqual(worker.wait(timeout=5), 0)
+        self.assertEqual(self.git(self.repo, 'rev-parse', 'HEAD'), self.initial)
+        os.write(master, b'\n')
+        output = self.terminal_read(master, b'Apply now?')
+        self.assertNotIn(b'DESCRIPTION', output)
+        os.write(master, b'n\n')
+
+    def test_manual_status_shares_table_with_pending_confirmation(self):
+        self.incoming()
+        self.shell('repowatcher fetch')
+        master = self.terminal('REPOWATCHER_FETCH=false\n')
+        self.terminal_read(master, b'LOCATION:')
+        os.write(master, b"cd 'working tree'; repowatcher status\n")
+        output = self.terminal_read(master, b'Apply now?')
+        self.assertEqual(output.count(b'DESCRIPTION'), 1)
+        os.write(master, b'n\n')
+        self.terminal_read(master, b'LOCATION:')
+        os.write(master, b'\n')
+        output = self.terminal_read(master, duration=0.4)
+        self.assertNotIn(b'DESCRIPTION', output)
+        self.assertNotIn(b'Apply now?', output)
+
+    def test_async_fetch_preserves_partially_typed_command(self):
+        self.incoming()
+        master = self.delayed_terminal()
+        self.terminal_read(master, b'LOCATION:')
+        os.write(master, b"cd 'working tree'\n")
+        self.terminal_read(master, b'LOCATION:')
+        os.write(master, b"print -- TYPED''_COMMAND")
+        output = self.terminal_read(master, duration=2)
+        self.assertNotIn(b'DESCRIPTION', output)
+        self.assertNotIn(b'Apply now?', output)
+        os.write(master, b'\n')
+        output = self.terminal_read(master, b'Apply now?')
+        self.assertIn(b'TYPED_COMMAND', output)
+        self.assertEqual(output.count(b'DESCRIPTION'), 1)
+        os.write(master, b'n\n')
+
+    def test_leaving_repository_cleans_completion_descriptor(self):
+        self.incoming()
+        master = self.delayed_terminal()
+        self.terminal_read(master, b'LOCATION:')
+        os.write(master, b"cd 'working tree'\n")
+        self.terminal_read(master, b'LOCATION:')
+        os.write(master, b"cd ..; print -- FD:${_repowatcher_worker_fd:-closed}\n")
+        output = self.terminal_read(master, b'FD:closed')
+        output += self.terminal_read(master, duration=2)
+        self.assertNotIn(b'DESCRIPTION', output)
+        self.assertNotIn(b'bad file descriptor', output)
+        self.assertEqual(self.git(self.repo, 'rev-parse', 'HEAD'), self.initial)
+
+    def test_exit_unregisters_pending_fetch_callback(self):
+        self.incoming()
+        master = self.delayed_terminal()
+        self.terminal_read(master, b'LOCATION:')
+        os.write(master, b"cd 'working tree'\n")
+        self.terminal_read(master, b'LOCATION:')
+        os.write(master, b'exit\n')
+        output = self.terminal_read(master, duration=2)
+        self.assertNotIn(b'DESCRIPTION', output)
+        self.assertNotIn(b'bad file descriptor', output)
+        self.assertEqual(self.git(self.repo, 'rev-parse', 'HEAD'), self.initial)
+
+    def test_async_auto_mode_defers_checkout_changes(self):
+        self.incoming()
+        master = self.delayed_terminal(mode='auto')
+        self.terminal_read(master, b'LOCATION:')
+        os.write(master, b"cd 'working tree'\n")
+        self.terminal_read(master, b'Press Enter to continue')
+        self.assertEqual(self.git(self.repo, 'rev-parse', 'HEAD'), self.initial)
 
     def test_interactive_confirmation_and_decline(self):
         self.incoming()
