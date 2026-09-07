@@ -13,6 +13,7 @@ fi
 
 typeset -gA _repowatcher_seen _repowatcher_displayed
 typeset -g _repowatcher_worker_fd='' _repowatcher_worker_root=''
+typeset -g _repowatcher_entry_root='' _repowatcher_entry_pending=false
 
 _repowatcher_context() {
   emulate -L zsh
@@ -299,6 +300,19 @@ _repowatcher_ready() {
   zle -R
 }
 
+# Remember repository transitions, including leaving and re-entering between prompts.
+# Keep an active callback when moving inside the same worktree.
+_repowatcher_directory_changed() {
+  emulate -L zsh
+  local root
+  root=$(command git rev-parse --show-toplevel 2>/dev/null) || root=''
+  [[ -z $root ]] || root=${root:A}
+  [[ $root != $_repowatcher_entry_root ]] || return 0
+  _repowatcher_cleanup
+  _repowatcher_entry_root=$root
+  _repowatcher_entry_pending=true
+}
+
 _repowatcher_start_fetch() {
   emulate -L zsh
   if zle 2>/dev/null; then
@@ -306,20 +320,23 @@ _repowatcher_start_fetch() {
     _repowatcher_worker_root=$_rw_root
     # Another shell may already be fetching. Wait only in this worker so its
     # eventual refs still reach our idle prompt; all foreground calls stay nonblocking.
-    exec {_repowatcher_worker_fd}< <(_repowatcher_fetch false 30; print -r -- done 2>/dev/null)
+    exec {_repowatcher_worker_fd}< <(_repowatcher_fetch true 30; print -r -- done 2>/dev/null)
     zle -F -w "$_repowatcher_worker_fd" _repowatcher_ready
   else
-    (_repowatcher_fetch false) &!
+    (_repowatcher_fetch true) &!
   fi
 }
 
 _repowatcher_prompt() {
   emulate -L zsh
+  _repowatcher_directory_changed
+  local entered=$_repowatcher_entry_pending
+  _repowatcher_entry_pending=false
   _repowatcher_context || return 0
   [[ $_rw_mode != off ]] || return 0
   # Create once without truncating an existing lock file.
   [[ -e $_rw_cache/lock ]] || (umask 077; : >> "$_rw_cache/lock")
-  if [[ $_rw_fetch == true && ${1-} != completed ]]; then
+  if [[ $_rw_fetch == true && $entered == true && ${1-} != completed ]]; then
     _repowatcher_start_fetch
   fi
   _repowatcher_counts || return 0
@@ -488,7 +505,7 @@ repowatcher() {
   [[ -e $_rw_cache/lock ]] || (umask 077; : >> "$_rw_cache/lock")
   case $action in
     status)
-      print -r -- "fetch=$_rw_fetch mode=$_rw_mode interval=${_rw_interval}s"
+      print -r -- "fetch=$_rw_fetch mode=$_rw_mode scan-interval=${_rw_interval}s"
       _repowatcher_counts || { print -r -- 'No current branch with a valid upstream.'; return 1; }
       print -r -- "$_rw_ahead ahead, $_rw_behind behind (last fetched state)."
       [[ -n $_rw_upstream ]] || print -r -- "No upstream configured; base information only."
@@ -518,7 +535,7 @@ if [[ -o interactive ]]; then
   zmodload zsh/zle
   zle -N _repowatcher_ready
   autoload -Uz add-zle-hook-widget add-zsh-hook
-  add-zsh-hook chpwd _repowatcher_cleanup
+  add-zsh-hook chpwd _repowatcher_directory_changed
   add-zsh-hook zshexit _repowatcher_cleanup
   add-zle-hook-widget line-init _repowatcher_prompt
 fi

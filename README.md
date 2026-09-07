@@ -71,13 +71,13 @@ source ~/.local/share/zsh-repowatcher/zsh-repowatcher.plugin.zsh
 
 ## Configure
 
-The defaults enable background fetching at most once every 15 minutes per shared Git directory and ask before applying updates. No configuration file is required for that behavior.
+The defaults fetch in the background when a shell starts inside a repository or you enter a different repository, and ask before applying updates. Re-entering after leaving a repository fetches again, even immediately. Ordinary commands and moving between subdirectories of the same repository do not start another fetch. No configuration file is required for that behavior.
 
 To customize it, create `~/.config/repowatcher/config.zsh` (or `$XDG_CONFIG_HOME/repowatcher/config.zsh`):
 
 ```zsh
 REPOWATCHER_FETCH=true
-REPOWATCHER_INTERVAL=900
+REPOWATCHER_INTERVAL=900 # Scan throttling and automatic-update freshness only.
 REPOWATCHER_MODE=ask
 
 # Optional search roots for `repowatcher scan`.
