@@ -62,6 +62,37 @@ class PluginTests(unittest.TestCase):
         self.assertEqual(self.git(self.repo, 'rev-parse', 'HEAD'), self.initial)
         self.assertNotEqual(self.git(self.repo, 'rev-parse', '@{u}'), self.initial)
 
+    def test_status_names_comparison_without_fetching(self):
+        self.incoming()
+        output = self.shell('repowatcher status').stdout
+        self.assertIn('Branch: main', output)
+        self.assertIn('Upstream: origin/main; 0 ahead, 0 behind (cached refs).', output)
+        self.assertIn('never recorded', output)
+        self.assertEqual(self.git(self.repo, 'rev-parse', '@{u}'), self.initial)
+        self.assertFalse(list((self.base / 'cache').glob('*/attempt')))
+
+    def test_status_preserves_success_after_failed_attempt_and_hides_log_contents(self):
+        self.shell('repowatcher fetch')
+        self.git(self.repo, 'remote', 'set-url', 'origin', str(self.base / 'SECRET-missing'))
+        self.shell('repowatcher fetch', ok=False)
+        output = self.shell('repowatcher status').stdout
+        self.assertRegex(output, r'Last successful fetch: [0-9]+s ago')
+        self.assertIn('latest fetch attempt failed', output)
+        self.assertIn('Fetch log:', output)
+        self.assertNotIn('SECRET', output)
+        self.git(self.repo, 'remote', 'set-url', 'origin', str(self.remote))
+        output = self.shell('repowatcher fetch; repowatcher status').stdout
+        self.assertNotIn('attempt failed', output)
+
+    def test_status_reports_busy_without_fetching(self):
+        output = self.shell(
+            '_repowatcher_context; : > "$_rw_cache/lock"; '
+            'zsystem flock -t 0 -f held "$_rw_cache/lock"; '
+            '(repowatcher fetch); (repowatcher status); zsystem flock -u $held').stdout
+        self.assertIn('Fetch/update in progress', output)
+        self.assertIn('latest fetch attempt busy', output)
+        self.assertFalse(list((self.base / 'cache').glob('*/attempt')))
+
     def test_pull_fast_forwards(self):
         self.incoming()
         self.shell('repowatcher pull')
@@ -157,7 +188,7 @@ class PluginTests(unittest.TestCase):
         config.parent.mkdir(parents=True)
         config.write_text('REPOWATCHER_MODE=notify\nREPOWATCHER_INTERVAL=123\n')
         output = self.shell('repowatcher status').stdout
-        self.assertIn('mode=notify interval=123s', output)
+        self.assertIn('mode=notify scan-interval=123s', output)
 
     def test_scan_fetches_without_pull_and_deduplicates(self):
         self.incoming()
@@ -214,7 +245,7 @@ class PluginTests(unittest.TestCase):
         self.shell('REPOWATCHER_ROOTS=("$PWD/.."); REPOWATCHER_EXCLUDE=("working tree" seed); repowatcher scan')
         self.assertEqual(self.git(self.repo, 'rev-parse', '@{u}'), self.initial)
 
-    def test_interval_throttles_background_attempts(self):
+    def test_interval_throttles_scan_style_attempts(self):
         self.shell('repowatcher fetch')
         self.incoming()
         self.shell('_repowatcher_context; _repowatcher_fetch false')
@@ -399,12 +430,12 @@ class PluginTests(unittest.TestCase):
             os.kill(pid, 9)
             os.waitpid(pid, 0)
 
-    def terminal(self, rc):
+    def terminal(self, rc, cwd=None):
         (self.base / '.zshrc').write_text(
             f'source "{PLUGIN}"\nPS1="LOCATION:%~ > "\n' + rc)
         pid, master = pty.fork()
         if pid == 0:
-            os.chdir(self.base)
+            os.chdir(cwd or self.base)
             os.execvpe('zsh', ['zsh', '-di'], dict(self.env, ZDOTDIR=str(self.base), TERM='xterm-256color'))
         def cleanup():
             os.close(master)
@@ -437,6 +468,92 @@ class PluginTests(unittest.TestCase):
             f'source "{PLUGIN}"\nREPOWATCHER_MODE={mode}\n'
             'functions[_repowatcher_original_fetch]=$functions[_repowatcher_fetch]\n'
             '_repowatcher_fetch() { sleep 1; _repowatcher_original_fetch "$@"; }\n')
+
+    def test_background_failure_notifies_idle_prompt_once(self):
+        self.git(self.repo, 'remote', 'set-url', 'origin', str(self.base / 'missing'))
+        master = self.terminal('REPOWATCHER_MODE=notify\n', cwd=self.repo)
+        output = self.terminal_read(master, b'Fetch log:')
+        self.assertIn(b'latest fetch attempt failed', output)
+        self.assertLess(output.index(b'LOCATION:'), output.index(b'latest fetch'))
+        self.terminal_read(master, duration=0.2)
+        os.write(master, b'print ok\n')
+        output = self.terminal_read(master, duration=0.5)
+        self.assertNotIn(b'latest fetch attempt', output)
+
+    def test_background_failure_preserves_typed_input_until_next_prompt(self):
+        self.git(self.repo, 'remote', 'set-url', 'origin', str(self.base / 'missing'))
+        master = self.delayed_terminal('notify')
+        self.terminal_read(master, b'LOCATION:')
+        os.write(master, b"cd 'working tree'\n")
+        self.terminal_read(master, b'LOCATION:')
+        os.write(master, b'print preserved')
+        output = self.terminal_read(master, duration=1.5)
+        self.assertNotIn(b'latest fetch attempt', output)
+        os.write(master, b'\n')
+        output = self.terminal_read(master, b'Fetch log:')
+        self.assertIn(b'preserved', output)
+        self.assertIn(b'latest fetch attempt failed', output)
+
+    def test_startup_fetch_bypasses_recent_attempt(self):
+        self.shell('repowatcher fetch')
+        self.incoming()
+        master = self.terminal('REPOWATCHER_MODE=notify\n', cwd=self.repo)
+        output = self.terminal_read(master, b'DESCRIPTION')
+        self.assertLess(output.index(b'LOCATION:'), output.index(b'DESCRIPTION'))
+        self.assertEqual(self.git(self.repo, 'rev-parse', '@{u}'),
+                         self.git(self.seed, 'rev-parse', 'HEAD'))
+        self.assertEqual(self.git(self.repo, 'rev-parse', 'HEAD'), self.initial)
+
+    def test_only_repository_entries_fetch_even_with_zero_interval(self):
+        (self.repo / 'nested').mkdir()
+        counter = self.base / 'fetch-count'
+        master = self.terminal(
+            'REPOWATCHER_INTERVAL=0\nREPOWATCHER_MODE=notify\n'
+            'functions[_original_fetch]=$functions[_repowatcher_fetch]\n'
+            '_repowatcher_fetch() { _original_fetch "$@"; print done >> "$HOME/fetch-count"; }\n')
+        self.terminal_read(master, b'LOCATION:')
+        self.assertFalse(counter.exists())
+
+        def count():
+            return len(counter.read_text().splitlines()) if counter.exists() else 0
+
+        def command(text, expected):
+            os.write(master, text.encode() + b'\n')
+            self.terminal_read(master, b'LOCATION:')
+            deadline = time.monotonic() + 5
+            while count() < expected and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.terminal_read(master, duration=0.3)
+            self.assertEqual(count(), expected)
+
+        command("cd 'working tree'", 1)
+        command('print harmless', 1)
+        command('cd nested', 1)
+        command('cd ..', 1)
+        command("cd ..; cd 'working tree'", 2)
+        command('cd ../seed', 3)
+        command("cd '../working tree'", 4)
+
+    def test_entry_respects_fetch_and_mode_optouts(self):
+        self.incoming()
+        for setting in ('REPOWATCHER_FETCH=false', 'REPOWATCHER_MODE=off'):
+            with self.subTest(setting=setting):
+                master = self.terminal(setting + '\n', cwd=self.repo)
+                self.terminal_read(master, b'LOCATION:')
+                self.terminal_read(master, duration=0.4)
+                self.assertEqual(self.git(self.repo, 'rev-parse', '@{u}'), self.initial)
+
+    def test_subdirectory_change_preserves_pending_notification(self):
+        self.incoming()
+        (self.repo / 'nested').mkdir()
+        master = self.delayed_terminal(mode='notify')
+        self.terminal_read(master, b'LOCATION:')
+        os.write(master, b"cd 'working tree'\n")
+        self.terminal_read(master, b'LOCATION:')
+        os.write(master, b'cd nested\n')
+        output = self.terminal_read(master, b'DESCRIPTION')
+        self.assertIn(b'nested', output)
+        self.assertEqual(self.git(self.repo, 'rev-parse', 'HEAD'), self.initial)
 
     def test_delayed_fetch_notifies_idle_prompt_without_enter(self):
         self.incoming()

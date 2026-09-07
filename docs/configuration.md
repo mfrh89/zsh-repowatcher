@@ -7,7 +7,7 @@ The plugin loads `${XDG_CONFIG_HOME:-$HOME/.config}/repowatcher/config.zsh`. Set
 | Setting | Default | Purpose |
 | --- | --- | --- |
 | `REPOWATCHER_FETCH` | `true` | `true` or `false`: enable automatic fetching. |
-| `REPOWATCHER_INTERVAL` | `900` | Minimum seconds between automatic fetch attempts per shared Git directory. Failed attempts are throttled too. |
+| `REPOWATCHER_INTERVAL` | `900` | Minimum seconds between scan fetch attempts per shared Git directory, including failures; also the successful-fetch freshness window for automatic updates. Repository entries always fetch regardless of this interval. |
 | `REPOWATCHER_MODE` | `ask` | `off`, `notify`, `ask`, or `auto`. |
 | `REPOWATCHER_ROOTS` | No roots | Zsh array of directories searched by `repowatcher scan`. |
 | `REPOWATCHER_DEPTH` | `5` | Maximum directory depth for discovery. Zero checks only the listed roots. |
@@ -82,3 +82,5 @@ REPOWATCHER_LINK_ICON='↗'
 ```
 
 Use `REPOWATCHER_LINKS=off` for plain hashes. Unknown hosts and remote formats fall back to plain text. Remote credentials are not printed. The key or mouse gesture used to open a link depends on the terminal.
+
+`repowatcher status` labels this interval as `scan-interval` to distinguish it from immediate repository-entry fetches.

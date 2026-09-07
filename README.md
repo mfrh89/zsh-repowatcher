@@ -71,13 +71,13 @@ source ~/.local/share/zsh-repowatcher/zsh-repowatcher.plugin.zsh
 
 ## Configure
 
-The defaults enable background fetching at most once every 15 minutes per shared Git directory and ask before applying updates. No configuration file is required for that behavior.
+The defaults fetch in the background when a shell starts inside a repository or you enter a different repository, and ask before applying updates. Re-entering after leaving a repository fetches again, even immediately. Ordinary commands and moving between subdirectories of the same repository do not start another fetch. No configuration file is required for that behavior.
 
 To customize it, create `~/.config/repowatcher/config.zsh` (or `$XDG_CONFIG_HOME/repowatcher/config.zsh`):
 
 ```zsh
 REPOWATCHER_FETCH=true
-REPOWATCHER_INTERVAL=900
+REPOWATCHER_INTERVAL=900 # Scan throttling and automatic-update freshness only.
 REPOWATCHER_MODE=ask
 
 # Optional search roots for `repowatcher scan`.
@@ -110,7 +110,7 @@ See the [configuration reference](docs/configuration.md) for every setting, excl
 
 | Command | Scope and behavior |
 | --- | --- |
-| `repowatcher status` | Current repo: settings, ahead/behind counts, and commit tables from the last fetched state. Also the default when called without arguments. |
+| `repowatcher status` | Current repo: branch/upstream, cached ahead/behind counts, last successful fetch age, fetch state, and commit tables. Also the default without arguments. |
 | `repowatcher fetch` | Current repo: fetch immediately without changing checked-out files. |
 | `repowatcher pull` | Current repo: fetch, check eligibility, and apply a fast-forward update. |
 | `repowatcher scan` | Configured search roots: discover repos, fetch subject to settings and interval, and show a table for each repo with incoming commits. Never pull. |
@@ -142,6 +142,8 @@ Only the checked-out branch is updated. The plugin never automatically stashes, 
 Locks coordinate plugin operations across terminals and linked worktrees. They cannot coordinate unrelated editors or Git commands. A conflict-free update can still contain broken code or configuration; use `ask` or `notify` where you want to inspect changes first.
 
 Read the [update behavior and limitations](docs/behavior.md) for authentication, notifications, and Git details.
+
+`repowatcher status` shows the branch/upstream comparison, last successful fetch age, active fetch/update operations, and failed or busy attempts. Fetch failures appear once at an idle prompt with a retry hint and log path; Git log contents are never printed automatically.
 
 ## Development
 
