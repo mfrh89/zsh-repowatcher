@@ -11,7 +11,7 @@ if [[ -r ${REPOWATCHER_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/repowatcher/con
   source "${REPOWATCHER_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/repowatcher/config.zsh}"
 fi
 
-typeset -gA _repowatcher_seen _repowatcher_displayed
+typeset -gA _repowatcher_seen _repowatcher_displayed _repowatcher_failures_seen
 typeset -g _repowatcher_worker_fd='' _repowatcher_worker_root=''
 typeset -g _repowatcher_entry_root='' _repowatcher_entry_pending=false
 
@@ -38,21 +38,82 @@ _repowatcher_fetch() {
   emulate -L zsh
   local force=${1:-false} lock_wait=${2:-0} fd last=0
   local -A info
-  zsystem flock -t "$lock_wait" -f fd "$_rw_cache/lock" 2>/dev/null || return 2
+  zsystem flock -t "$lock_wait" -f fd "$_rw_cache/lock" 2>/dev/null || {
+    _repowatcher_record_issue busy
+    return 2
+  }
   {
     if zstat -H info "$_rw_cache/attempt" 2>/dev/null; then last=$info[mtime]; fi
     [[ $force == true ]] || (( EPOCHSECONDS - last >= _rw_interval )) || return 0
     : > "$_rw_cache/attempt"
+    # Retain timestamps from caches created by earlier plugin versions too.
+    if [[ -e $_rw_cache/success && ! -e $_rw_cache/last-success ]]; then
+      command cp -p -- "$_rw_cache/success" "$_rw_cache/last-success"
+    fi
     command rm -f -- "$_rw_cache/success"
     if GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -o BatchMode=yes -o ConnectTimeout=10}" \
       command git -C "$_rw_root" fetch --all --quiet --no-recurse-submodules > "$_rw_cache/fetch.log" 2>&1; then
       : > "$_rw_cache/success"
+      : > "$_rw_cache/last-success"
+      command rm -f -- "$_rw_cache/issue"
     else
+      _repowatcher_record_issue failed
       return 1
     fi
   } always {
     zsystem flock -u $fd
   }
+}
+
+# Publish a complete outcome so concurrent shells never read a partial record.
+_repowatcher_record_issue() {
+  emulate -L zsh
+  local temporary="$_rw_cache/issue.$sysparams[pid]"
+  (umask 077; print -r -- "$1 $EPOCHREALTIME" > "$temporary") &&
+    command mv -f -- "$temporary" "$_rw_cache/issue"
+}
+
+_repowatcher_issue() {
+  emulate -L zsh
+  local issue=''
+  [[ -r $_rw_cache/issue ]] && issue=$(<"$_rw_cache/issue")
+  [[ $issue == (failed|busy)' '* ]] || return 0
+  local key="$_rw_cache:$issue"
+  [[ -z ${_repowatcher_failures_seen[$key]-} || ${1-} == status ]] || return 0
+  if zle 2>/dev/null; then
+    (( PENDING > 0 || KEYS_QUEUED_COUNT > 0 )) && return 0
+    [[ -z $BUFFER ]] || return 0
+    zle -R
+    zle -I
+  fi
+  _repowatcher_text "${_rw_root:t}" 1000
+  print -r -- "repowatcher: $REPLY: latest fetch attempt ${issue%% *}; cached refs may be stale."
+  print -r -- 'Retry with `repowatcher fetch`.'
+  if [[ $issue == failed* ]]; then
+    _repowatcher_text "$_rw_cache/fetch.log" 10000
+    print -r -- "Fetch log: $REPLY"
+  fi
+  _repowatcher_failures_seen[$key]=1
+}
+
+_repowatcher_fetch_status() {
+  emulate -L zsh
+  local -A info
+  local stamp="$_rw_cache/last-success" age fd
+  [[ -e $stamp ]] || stamp="$_rw_cache/success"
+  if zstat -H info "$stamp" 2>/dev/null; then
+    age=$(( EPOCHSECONDS - info[mtime] ))
+    (( age < 0 )) && age=0
+    print -r -- "Last successful fetch: ${age}s ago."
+  else
+    print -r -- 'Last successful fetch: never recorded by Repowatcher.'
+  fi
+  if zsystem flock -t 0 -f fd "$_rw_cache/lock" 2>/dev/null; then
+    zsystem flock -u $fd
+  else
+    print -r -- 'Fetch/update in progress in this or another shell.'
+  fi
+  _repowatcher_issue status
 }
 
 _repowatcher_counts() {
@@ -339,6 +400,7 @@ _repowatcher_prompt() {
   if [[ $_rw_fetch == true && $entered == true && ${1-} != completed ]]; then
     _repowatcher_start_fetch
   fi
+  _repowatcher_issue
   _repowatcher_counts || return 0
   (( _rw_behind > 0 || _rw_base_behind > 0 )) || return 0
   local key="$_rw_root:$_rw_head:$_rw_upstream:$_rw_base:$_rw_mode"
@@ -507,13 +569,25 @@ repowatcher() {
     status)
       print -r -- "fetch=$_rw_fetch mode=$_rw_mode scan-interval=${_rw_interval}s"
       _repowatcher_counts || { print -r -- 'No current branch with a valid upstream.'; return 1; }
-      print -r -- "$_rw_ahead ahead, $_rw_behind behind (last fetched state)."
-      [[ -n $_rw_upstream ]] || print -r -- "No upstream configured; base information only."
+      _repowatcher_text "$_rw_branch" 1000
+      print -r -- "Branch: $REPLY"
+      if [[ -n $_rw_upstream ]]; then
+        _repowatcher_text "$_rw_upstream_ref" 1000
+        print -r -- "Upstream: $REPLY; $_rw_ahead ahead, $_rw_behind behind (cached refs)."
+      else
+        print -r -- 'No upstream configured; base information only.'
+      fi
+      _repowatcher_fetch_status
       _repowatcher_table
       local shown_key="$_rw_root:$_rw_head:$_rw_upstream:$_rw_base:$_rw_mode"
       _repowatcher_displayed[$shown_key]=1
       ;;
-    fetch) _repowatcher_fetch true ;;
+    fetch)
+      _repowatcher_fetch true
+      local fetched=$?
+      (( fetched == 0 )) || _repowatcher_issue status
+      return $fetched
+      ;;
     pull)
       _repowatcher_fetch true
       local fetched=$?

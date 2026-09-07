@@ -10,6 +10,8 @@ Notifications are normally shown once per current branch/upstream/base commit st
 
 `repowatcher status` displays the table once; the next prompt can still ask to apply it without repeating the table.
 
+`repowatcher status` names the current branch and its upstream comparison, reports the age of the last successful plugin fetch (or that none is recorded), and identifies an active fetch/update lock. A later failed fetch does not erase the last successful timestamp. Failed or busy attempts include a retry command; failures also show the log path without printing potentially sensitive Git output. Background failures are reported once per attempt at an idle prompt, or deferred until typed/pasted input has finished. An explicit status displays the failure again but suppresses another automatic copy.
+
 `repowatcher status` reads existing remote-tracking refs. It does not fetch. `scan` respects `REPOWATCHER_INTERVAL` (or local `repowatcher.interval`), whereas repository entry and explicit `fetch` and `pull` commands request an immediate fetch. The interval also defines how recent a successful fetch must be for automatic updates. It is not a periodic timer. `REPOWATCHER_FETCH=false` and mode `off` still disable automatic entry fetches.
 
 Every scan prints a completion message. It reports checked repositories, those with

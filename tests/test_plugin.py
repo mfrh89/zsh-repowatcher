@@ -62,6 +62,37 @@ class PluginTests(unittest.TestCase):
         self.assertEqual(self.git(self.repo, 'rev-parse', 'HEAD'), self.initial)
         self.assertNotEqual(self.git(self.repo, 'rev-parse', '@{u}'), self.initial)
 
+    def test_status_names_comparison_without_fetching(self):
+        self.incoming()
+        output = self.shell('repowatcher status').stdout
+        self.assertIn('Branch: main', output)
+        self.assertIn('Upstream: origin/main; 0 ahead, 0 behind (cached refs).', output)
+        self.assertIn('never recorded', output)
+        self.assertEqual(self.git(self.repo, 'rev-parse', '@{u}'), self.initial)
+        self.assertFalse(list((self.base / 'cache').glob('*/attempt')))
+
+    def test_status_preserves_success_after_failed_attempt_and_hides_log_contents(self):
+        self.shell('repowatcher fetch')
+        self.git(self.repo, 'remote', 'set-url', 'origin', str(self.base / 'SECRET-missing'))
+        self.shell('repowatcher fetch', ok=False)
+        output = self.shell('repowatcher status').stdout
+        self.assertRegex(output, r'Last successful fetch: [0-9]+s ago')
+        self.assertIn('latest fetch attempt failed', output)
+        self.assertIn('Fetch log:', output)
+        self.assertNotIn('SECRET', output)
+        self.git(self.repo, 'remote', 'set-url', 'origin', str(self.remote))
+        output = self.shell('repowatcher fetch; repowatcher status').stdout
+        self.assertNotIn('attempt failed', output)
+
+    def test_status_reports_busy_without_fetching(self):
+        output = self.shell(
+            '_repowatcher_context; : > "$_rw_cache/lock"; '
+            'zsystem flock -t 0 -f held "$_rw_cache/lock"; '
+            '(repowatcher fetch); (repowatcher status); zsystem flock -u $held').stdout
+        self.assertIn('Fetch/update in progress', output)
+        self.assertIn('latest fetch attempt busy', output)
+        self.assertFalse(list((self.base / 'cache').glob('*/attempt')))
+
     def test_pull_fast_forwards(self):
         self.incoming()
         self.shell('repowatcher pull')
@@ -437,6 +468,31 @@ class PluginTests(unittest.TestCase):
             f'source "{PLUGIN}"\nREPOWATCHER_MODE={mode}\n'
             'functions[_repowatcher_original_fetch]=$functions[_repowatcher_fetch]\n'
             '_repowatcher_fetch() { sleep 1; _repowatcher_original_fetch "$@"; }\n')
+
+    def test_background_failure_notifies_idle_prompt_once(self):
+        self.git(self.repo, 'remote', 'set-url', 'origin', str(self.base / 'missing'))
+        master = self.terminal('REPOWATCHER_MODE=notify\n', cwd=self.repo)
+        output = self.terminal_read(master, b'Fetch log:')
+        self.assertIn(b'latest fetch attempt failed', output)
+        self.assertLess(output.index(b'LOCATION:'), output.index(b'latest fetch'))
+        self.terminal_read(master, duration=0.2)
+        os.write(master, b'print ok\n')
+        output = self.terminal_read(master, duration=0.5)
+        self.assertNotIn(b'latest fetch attempt', output)
+
+    def test_background_failure_preserves_typed_input_until_next_prompt(self):
+        self.git(self.repo, 'remote', 'set-url', 'origin', str(self.base / 'missing'))
+        master = self.delayed_terminal('notify')
+        self.terminal_read(master, b'LOCATION:')
+        os.write(master, b"cd 'working tree'\n")
+        self.terminal_read(master, b'LOCATION:')
+        os.write(master, b'print preserved')
+        output = self.terminal_read(master, duration=1.5)
+        self.assertNotIn(b'latest fetch attempt', output)
+        os.write(master, b'\n')
+        output = self.terminal_read(master, b'Fetch log:')
+        self.assertIn(b'preserved', output)
+        self.assertIn(b'latest fetch attempt failed', output)
 
     def test_startup_fetch_bypasses_recent_attempt(self):
         self.shell('repowatcher fetch')
